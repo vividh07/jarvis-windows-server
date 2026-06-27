@@ -1,0 +1,335 @@
+=================================================
+JARVIS PROJECT — COMPLETE CONTEXT FOR AI HANDOFF
+=================================================
+Purpose: Give any AI assistant (Cursor, Claude, etc.) full
+context to continue this project without prior conversation
+history.
+
+Last updated: 2026-06-26 (paths corrected, live folder confirmed,
+user decisions recorded)
+
+=================================================
+PROJECT OVERVIEW
+=================================================
+Jarvis is a personal AI assistant — a physical desk device
+(in progress) paired with a React Native mobile app, backed
+by a Python WebSocket server running on the user's PC.
+
+Owner: Vividh
+Personality: Male, friendly, casual voice
+Visual identity: Retro pixel-art animated face on a Pygame
+window (idle, listening, thinking, speaking, confused states)
+
+OUT OF SCOPE: jarvis_pi_server.py — not part of this project
+(Raspberry Pi variant, removed/ignored).
+
+=================================================
+CORRECT PROJECT PATHS (use these, not old paths)
+=================================================
+MOBILE APP (live):  D:\Project\JarvisV2
+  Confirmed live: .expo folder exists here.
+  D:\workspace\JarvisV2 does NOT exist — stale path in old docs.
+
+SERVER:             D:\Project\server\
+  jarvis_windows_server.py   — main WebSocket server
+  jarvis_pc_daemon.py        — Git/window tracking daemon
+  jarvis_face.py               — Pygame face renderer
+  jarvis_memory.json           — persistent conversation + facts
+  esp32_firmware\sensors.ino   — sensor scaffold only (no hardware yet)
+  JARVIS_PROJECT_CONTEXT.txt   — this file
+
+PC DAEMON WATCH PATH: D:\Project (set in jarvis_pc_daemon.py)
+
+OLD WRONG PATHS (do not use):
+  C:\server\
+  D:\workspace\JarvisV2
+
+=================================================
+TECH STACK
+=================================================
+MOBILE APP:
+- React Native + Expo (Expo Go, SDK 54)
+- Location: D:\Project\JarvisV2
+- Zustand for state management
+- TypeScript throughout
+- React Navigation (Stack + Bottom Tabs)
+
+SERVER:
+- Python, asyncio + websockets
+- Location: D:\Project\server\jarvis_windows_server.py
+- Runs on user's main gaming PC (i5 14th gen, 8GB RAM, RTX 5060 8GB)
+- Companion: D:\Project\server\jarvis_pc_daemon.py (Git/window tracking)
+- Companion: D:\Project\server\jarvis_face.py (Pygame face renderer,
+  runs in separate process via multiprocessing)
+
+AI BACKEND (cloud APIs, NOT local LLM):
+- Multi-provider: Groq (free, default), Claude Haiku, Gemini Flash
+- User switches provider from app Settings screen
+- Originally planned local LLM (Phi-3 Mini/Llama 3.2) but pivoted
+  to cloud APIs due to RAM constraints on test hardware
+- STT: OpenAI Whisper (CPU mode — forced via
+  os.environ["CUDA_VISIBLE_DEVICES"] = "" because RTX 5060 uses
+  sm_120 architecture not yet supported by stable PyTorch)
+- TTS: pyttsx3 — MUST create a fresh engine instance per speak()
+  call (engine = pyttsx3.init() inside the function, not global)
+  or it throws "run loop already started" after first call.
+  NOTE (2026-06-26 audit): speak() already uses fresh init per call,
+  BUT init_tts() still runs at startup and keeps a global tts_engine —
+  likely why the bug persisted. Full fix = remove global init_tts()
+  and tts_engine entirely, not only patch speak().
+
+=================================================
+API KEYS — STATUS (hardcoded today; .env optional later)
+=================================================
+User preference: keys are hardcoded for now. Moving to .env is
+optional when implementing — if so, tell user which vars to set.
+
+SERVER — jarvis_windows_server.py:
+  GROQ_API_KEY       — SET (working, default provider)
+  GEMINI_API_KEY     — SET (verify if Gemini errors persist)
+  ANTHROPIC_API_KEY  — SKIPPED for now (Claude disabled in app until added)
+  CURSOR API KEY     — NOT USABLE here. Cursor API runs Cursor agents/IDE
+                       automation, not chat completions for Jarvis. Use Groq
+                       or Gemini instead; hide or disable Claude in Settings
+                       until Anthropic key is added later.
+
+APP — D:\Project\JarvisV2\src\services\:
+  weatherService.ts  — SET (OpenWeatherMap)
+  newsService.ts     — SET (user provided key — wire into file when coding)
+  spotifyService.ts  — SET (user provided client ID + secret — wire when coding)
+  calendarService.ts — SET (user provided OAuth web client JSON — correct type.
+                       Client ID ends in .apps.googleusercontent.com.
+                       Wire GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET into file
+                       when coding. Redirect URI in app: jarvis://calendar-callback
+                       — must match an authorized redirect in Google Cloud Console.)
+
+SUMMARY — still needed:
+  1. ANTHROPIC_API_KEY — optional later if Claude provider wanted
+
+Ready to wire (user gave values; add to service files when coding starts):
+  newsService.ts, spotifyService.ts, calendarService.ts
+
+Do NOT paste real key values into this context file.
+
+=================================================
+CURRENT FILE STRUCTURE (D:\Project\JarvisV2\src)
+=================================================
+theme/
+  colors.ts, typography.ts, spacing.ts
+types/
+  index.ts (Message, Reminder, JarvisStatus, WeatherData, etc.)
+services/
+  socketService.ts       — WebSocket client, event emitter pattern
+  weatherService.ts      — OpenWeatherMap (key set)
+  newsService.ts         — NewsAPI (key missing)
+  briefingService.ts     — combines weather + news into briefing
+  spotifyService.ts      — OAuth + playback (NOT FULLY WORKING, see Known Issues)
+  calendarService.ts     — Google Calendar OAuth (keys missing, untested)
+  notificationService.ts — general notifications + call screening
+  phoneService.ts        — battery monitoring (expo-battery), find-my-phone vibration
+  whatsappService.ts     — deep-link message drafting
+  aiService.ts           — AI_PROVIDERS list (groq/claude/gemini metadata)
+  bleService.ts          — BLE provisioning (skipped in Expo Go — see Decisions)
+store/ (all Zustand)
+  useJarvisStore.ts      — connected, status, pcStats
+  useChatStore.ts        — messages array
+  useSettingsStore.ts    — agentName, userName, aiProvider, spotifyLinked
+  useWeatherStore.ts
+  useSpotifyStore.ts
+  useCalendarStore.ts
+  useNotificationStore.ts
+  useContactsStore.ts    — name-to-phone mapping for WhatsApp drafts
+hooks/
+  useSocket.ts — central hook wiring ALL socket events to stores
+                 (connection, response, stats, pc_stats, mode,
+                 notification, incoming_sms, find_phone, draft_whatsapp)
+components/
+  BriefingModal.tsx
+  NotificationCard.tsx
+navigation/
+  AppNavigator.tsx — Provisioning → Connect → Main(tabs) flow
+  TabNavigator.tsx — Chat, Dashboard, History, Settings
+screens/
+  ConnectScreen.tsx      — IP-based WebSocket connect
+  ProvisioningScreen.tsx — BLE WiFi setup (skippable — use Skip in Expo Go)
+  ChatScreen.tsx         — real chat via useChatStore + socketService
+  DashboardScreen.tsx    — weather, spotify, calendar, sensors, pomodoro,
+                            notifications, PC stats, briefing button
+  HistoryScreen.tsx      — mock data still (not yet wired to real history)
+  SettingsScreen.tsx     — identity, AI provider picker, facts, contacts,
+                            briefing time, Spotify toggle, device controls
+  FactsScreen.tsx        — view/delete long-term memory facts
+  PCControlScreen.tsx    — remote app launching grid
+  ContactsScreen.tsx     — name/phone mapping for WhatsApp
+
+NOT YET BUILT: useBLE.ts, useVoice.ts and standalone component
+files (ChatBubble, JarvisAvatar, etc.) are intentionally empty —
+their logic lives inline in screens/services instead.
+
+=================================================
+SERVER FILE — jarvis_windows_server.py STRUCTURE
+=================================================
+Must support these WebSocket message types (sent by the app):
+- chat (text)              → AI response + TTS
+- voice                    → record 5s, Whisper transcribe, AI response + TTS
+- command (action: restart/sleep/wake/mute)
+- register (client: pc_daemon)
+- pc_stats (from daemon, relayed to app clients)
+- set_ai_provider (provider: groq/claude/gemini)
+- get_facts / delete_fact (index)
+- clear_memory
+- get_apps / launch_app (app name)
+- sensor_data (temperature/humidity/presence, from ESP32 — deferred)
+- set_briefing_time (time string) — NOT IMPLEMENTED on server yet
+- test_notification (dev/testing helper) — EXISTS on server
+
+Persistent memory: D:\Project\server\jarvis_memory.json stores
+conversation_history (capped ~30 messages) and long_term_facts
+(capped ~20). Loaded once at startup via load_history(), saved
+after every change via save_history().
+
+Identity/system prompt: JARVIS_IDENTITY + SYSTEM_PROMPT constants
+near top of file. Currently VERY restrictive ("ONE sentence,
+max 15 words") — causes robotic-sounding answers. Needs loosening
+for more natural conversation (see Known Issues).
+
+=================================================
+USER DECISIONS (confirmed 2026-06-26)
+=================================================
+1. CODING PRIORITY: Follow "Immediate Next Steps" order below
+   when user says to start coding.
+2. API KEYS: Hardcoded is fine for now; .env migration optional.
+   Missing keys listed in API KEYS section above.
+3. BLE: Skip provisioning in Expo Go for now (use Skip button).
+   EAS dev build deferred — not doing BLE work until later.
+4. ESP32 / HARDWARE: Deferred — parts not purchased yet.
+   Do not work on firmware or sensor integration until user has
+   hardware and asks to start.
+5. NO CODE WITHOUT APPROVAL: Cursor rule at
+   D:\Project\JarvisV2\.cursor\rules\no-code-without-approval.mdc
+   — analyze/plan first; implement only when user explicitly says go.
+
+=================================================
+KNOWN ISSUES / IN-PROGRESS BUGS
+=================================================
+1. TTS STOPS WORKING AFTER FIRST RESPONSE
+   Symptom: "TTS error: run loop already started" on every
+   message after the first. Root cause: pyttsx3 engine reuse.
+   speak() already creates fresh pyttsx3.init() per call, BUT
+   init_tts() still runs at startup (line ~622) and sets global
+   tts_engine — remove init_tts(), global tts_engine, and the
+   startup call; keep only per-call init inside speak().
+
+2. RESPONSES SOUND ROBOTIC
+   Cause: SYSTEM_PROMPT enforces "ONE sentence only, max 15 words,
+   never roleplay" — too rigid for natural conversation. Needs
+   rewriting to allow warmer, more human phrasing while still
+   being reasonably concise (not paragraphs, just not robotic
+   one-liners like "I am functioning within optimal parameters").
+
+3. SPOTIFY COMPLETELY NON-FUNCTIONAL
+   Root cause: Settings screen only has a Switch toggle for
+   "Spotify account" — this ONLY sets a local boolean
+   (setSpotifyLinked), it does NOT perform real OAuth. There is
+   no actual login flow wired up. spotifyService.ts has
+   getAuthUrl() and exchangeCode() functions but nothing in the
+   UI calls them or handles the redirect callback.
+   ALSO: Spotify CLIENT_ID and CLIENT_SECRET are still placeholders.
+   FIX NEEDED: Add keys, then build real OAuth flow — open getAuthUrl()
+   in a browser/WebView, handle jarvis://callback deep link,
+   extract the code param, call exchangeCode(code), THEN set
+   linked=true. isAuthenticated() always false because accessToken
+   is never set. Dashboard "Not playing" is a symptom of this.
+
+4. BLE PROVISIONING CRASHES IN EXPO GO
+   react-native-ble-plx is a native module, not supported in
+   Expo Go. DECISION: skip via Skip button for now; no EAS build
+   until user asks.
+
+5. expo-battery import error
+   Fixed by running: npx expo install expo-battery
+   (package is in package.json — confirmed installed)
+
+6. Gemini provider sometimes returns "Gemini had an issue, try
+   again!" — key is set on server; test with groq first to isolate.
+   If Gemini-only, key format or API quota may be the issue.
+
+7. API KEYS: News, Spotify, and Google Calendar OAuth keys received from user
+   (not yet in code files). Anthropic skipped — use Groq/Gemini only for now.
+
+=================================================
+HARDWARE STATUS
+=================================================
+NOT YET PURCHASED. Decided against Raspberry Pi (too expensive
+in India ~19-20k INR for usable RAM). Current plan: ESP32-based
+box since AI processing happens via cloud APIs, not on-device.
+
+Planned component list (~₹1,660-2,520 total):
+- ESP32 Dev Board
+- INMP441 I2S microphone
+- MAX98357A I2S amplifier
+- Mini speaker (3W)
+- ST7789 1.14" SPI TFT display
+- HC-SR501 PIR motion sensor
+- DHT22 temperature/humidity sensor
+- Breadboard, jumper wires, USB cable
+
+ESP32: esp32_firmware\sensors.ino exists as a scaffold only.
+sensor_data message type exists on server but no real hardware
+or firmware work until parts arrive and user requests it.
+
+=================================================
+FUTURE ROADMAP (post-V4)
+=================================================
+V5 — Camera & Vision (ESP32-CAM, object detection, face recognition)
+V6 — Mobility (motors, wheels, chassis, battery)
+V7 — Sensor Expansion (light, distance, gas, smoke, water leak, door/window sensors)
+
+Plus large software-only backlog organized into tiers:
+- Tier A: Memory & conversation intelligence (semantic search,
+  memory timeline, self-learning habits) — RECOMMENDED NEXT
+  priority after fixing current bugs, since it's pure software
+  and builds directly on existing facts/memory system
+- Tier B: AI capability (multi-agent mode, personality switching,
+  email assistant, voice cloning)
+- Tier C: Automation (plugin system, IFTTT-style rules, OTA updates)
+- Tier D: Screen/visual personality (themes, animations, clock faces)
+- Tier E: Fun extras (dice roller, roast mode, trivia, easter eggs)
+- Tier F: Stats dashboards (conversation density, environment score)
+
+Full detailed breakdown was generated as a separate document
+("Jarvis_Future_Roadmap_V5plus.txt") — recreate if needed by
+asking for "the V5+ roadmap organized by tier."
+
+=================================================
+USER PREFERENCES / WORKING STYLE
+=================================================
+- Prefers SHORT, token-efficient responses — no long explanations
+  unless asked
+- Wants step-by-step fixes one at a time, not big dumps, UNLESS
+  doing a full file rewrite is genuinely faster than back-and-forth
+- Self-described beginner with PowerShell/Python/React Native —
+  needs exact commands, not assumptions
+- Has hit context/token limits before — this document exists
+  specifically to solve that problem for continuity
+- Live app folder: D:\Project\JarvisV2 (confirmed — do not edit
+  stale duplicates)
+
+=================================================
+IMMEDIATE NEXT STEPS (in priority order — user approved)
+=================================================
+1. Fix TTS fully in D:\Project\server\jarvis_windows_server.py
+   — remove global init_tts()/tts_engine; keep fresh init in speak() only
+2. Loosen SYSTEM_PROMPT for more natural, less robotic responses
+3. Add Spotify API keys, then build real OAuth flow (browser/WebView +
+   jarvis://callback) — biggest broken feature
+4. Verify Gemini works (Anthropic/Cursor not used — Groq + Gemini only)
+5. Wire HistoryScreen to real server history (mock data today)
+6. Implement set_briefing_time server handler if app sends it
+7. Once stable: Tier A software features (memory upgrades)
+
+Wait for user to say "go" / "start" / "implement" before coding.
+
+=================================================
+END OF DOCUMENT
+=================================================
