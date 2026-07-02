@@ -50,6 +50,8 @@ except ImportError:
     FACE_AVAILABLE = False
     print("Pygame not available — running without face animations")
 
+from jarvis_wakeword import WakeWordMonitor, build_wake_phrases, strip_wake_prefix
+
 # ─────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────
@@ -57,6 +59,8 @@ WEBSOCKET_HOST = _env("WEBSOCKET_HOST", "0.0.0.0")
 WEBSOCKET_PORT = _env_int("WEBSOCKET_PORT", 8765)
 WHISPER_MODEL = "small"
 USER_NAME = _env("USER_NAME", "Vividh")
+AGENT_NAME = _env("AGENT_NAME", "Jarvis")
+WAKE_WORD_ENABLED = _env("WAKE_WORD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 GROQ_MODEL = _env("GROQ_MODEL", "llama-3.3-70b-versatile")
 
@@ -163,6 +167,14 @@ whisper_model = None
 message_queue = queue.Queue()
 briefing_time = "08:00"
 face = None
+wake_word_enabled = WAKE_WORD_ENABLED
+is_asleep = False
+mic_muted = False
+agent_name = AGENT_NAME
+audio_busy = threading.Event()
+main_loop = None
+wake_monitor = None
+wake_audio_queue = None
 
 fun_facts_list = [
     "Did you know honey never spoils?",
@@ -230,6 +242,7 @@ def _speak_pyttsx3(text: str):
 
 def speak(text: str):
     global current_mode
+    audio_busy.set()
     try:
         clean = strip_roleplay(text)
         clean = clean.encode('ascii', 'ignore').decode('ascii')
@@ -251,6 +264,8 @@ def speak(text: str):
         if face:
             face.set_state('idle')
         current_mode = "idle"
+    finally:
+        audio_busy.clear()
 
 
 # ─────────────────────────────────────────
@@ -264,18 +279,22 @@ def load_whisper():
 
 
 def record_audio(duration: int = 5, sample_rate: int = 16000) -> np.ndarray:
-    print(f"Recording for {duration} seconds... Speak now!")
-    if face:
-        face.set_state('listening')
-    audio = sd.rec(
-        int(duration * sample_rate),
-        samplerate=sample_rate,
-        channels=1,
-        dtype='float32'
-    )
-    sd.wait()
-    print("Recording done!")
-    return audio.flatten()
+    audio_busy.set()
+    try:
+        print(f"Recording for {duration} seconds... Speak now!")
+        if face:
+            face.set_state('listening')
+        audio = sd.rec(
+            int(duration * sample_rate),
+            samplerate=sample_rate,
+            channels=1,
+            dtype='float32'
+        )
+        sd.wait()
+        print("Recording done!")
+        return audio.flatten()
+    finally:
+        audio_busy.clear()
 
 
 def transcribe(audio: np.ndarray) -> str:
@@ -732,7 +751,7 @@ async def resolve_user_message(text: str, websocket) -> str:
         return random.choice(fun_facts_list)
 
     if "find my phone" in lowered or "where's my phone" in lowered or "where is my phone" in lowered:
-        await websocket.send(json.dumps({"type": "find_phone"}))
+        await broadcast_json({"type": "find_phone"})
         return "Ringing your phone now!"
 
     if detect_briefing_request(text):
@@ -756,6 +775,152 @@ def strip_roleplay(text: str) -> str:
     return cleaned if cleaned else text
 
 
+def get_wake_phrases() -> list[str]:
+    return build_wake_phrases(agent_name)
+
+
+def wake_word_should_listen() -> bool:
+    return (
+        wake_word_enabled
+        and not is_asleep
+        and not mic_muted
+        and current_mode in ("idle", "music")
+    )
+
+
+async def broadcast_json(payload: dict):
+    for client in connected_clients.copy():
+        try:
+            await client.send(json.dumps(payload))
+        except Exception:
+            pass
+
+
+async def broadcast_mode(mode: str):
+    await broadcast_json({"type": "mode", "mode": mode})
+
+
+async def process_user_text(text: str):
+    global current_mode
+
+    text = text.strip()
+    if not text:
+        return
+
+    print(f"\nUser: {text}")
+    current_mode = "thinking"
+    if face:
+        face.set_state('thinking')
+    await broadcast_mode("thinking")
+
+    add_to_history("user", text)
+    loop = asyncio.get_event_loop()
+    response = await resolve_user_message(text, None)
+    response = strip_roleplay(response)
+
+    print(f"Jarvis: {response}")
+    add_to_history("assistant", response)
+
+    current_mode = "speaking"
+    if face:
+        face.set_state('speaking')
+    await broadcast_json({"type": "response", "text": response})
+
+    await loop.run_in_executor(None, speak, response)
+
+
+async def process_voice_session():
+    """Record from mic, transcribe, and run the chat pipeline."""
+    global current_mode
+
+    current_mode = "listening"
+    if face:
+        face.set_state('listening')
+    await broadcast_mode("listening")
+
+    loop = asyncio.get_event_loop()
+    audio = await loop.run_in_executor(None, record_audio, 5)
+    text = await loop.run_in_executor(None, transcribe, audio)
+
+    if text:
+        await broadcast_json({"type": "transcription", "text": text})
+        await process_user_text(text)
+        if face:
+            face.set_state('idle')
+    else:
+        if face:
+            face.set_state('confused')
+        await broadcast_json({
+            "type": "response",
+            "text": "Sorry I didn't catch that. Try again!",
+        })
+        current_mode = "idle"
+        if face:
+            face.set_state('idle')
+
+
+def queue_wake_audio(audio: np.ndarray):
+    if main_loop and wake_audio_queue is not None:
+        main_loop.call_soon_threadsafe(wake_audio_queue.put_nowait, audio)
+
+
+async def handle_wake_audio(audio: np.ndarray):
+    global current_mode
+
+    loop = asyncio.get_event_loop()
+    text = await loop.run_in_executor(None, transcribe, audio)
+    if not text:
+        return
+
+    command = strip_wake_prefix(text, get_wake_phrases())
+    if command is None:
+        return
+
+    print(f"Wake word detected: {text}")
+    await broadcast_json({"type": "wake_detected", "text": text})
+
+    if command:
+        await process_user_text(command)
+        return
+
+    current_mode = "listening"
+    if face:
+        face.set_state('listening')
+    await broadcast_mode("listening")
+
+    ack = "Yes?"
+    await broadcast_json({"type": "response", "text": ack})
+    await loop.run_in_executor(None, speak, ack)
+
+    follow_up = await loop.run_in_executor(None, record_audio, 5)
+    follow_text = await loop.run_in_executor(None, transcribe, follow_up)
+    if follow_text:
+        await broadcast_json({"type": "transcription", "text": follow_text})
+        await process_user_text(follow_text)
+    else:
+        if face:
+            face.set_state('confused')
+        await broadcast_json({
+            "type": "response",
+            "text": "Sorry I didn't catch that. Try again!",
+        })
+        current_mode = "idle"
+        if face:
+            face.set_state('idle')
+
+
+async def wake_word_worker():
+    while True:
+        audio = await wake_audio_queue.get()
+        try:
+            if wake_word_should_listen():
+                await handle_wake_audio(audio)
+        except Exception as exc:
+            print(f"Wake-word handler error: {exc}")
+        finally:
+            wake_audio_queue.task_done()
+
+
 # ─────────────────────────────────────────
 #  WEBSOCKET HANDLERS
 # ─────────────────────────────────────────
@@ -769,7 +934,7 @@ async def send_stats_loop(websocket):
 
 
 async def handle_message(websocket, message: str):
-    global current_mode, AI_PROVIDER, briefing_time
+    global current_mode, AI_PROVIDER, briefing_time, wake_word_enabled, is_asleep, mic_muted, agent_name, USER_NAME
 
     try:
         data = json.loads(message)
@@ -778,73 +943,28 @@ async def handle_message(websocket, message: str):
         # ── Chat ──
         if msg_type == "chat":
             text = data.get("text", "")
-            print(f"\nUser: {text}")
-
-            current_mode = "thinking"
-            if face:
-                face.set_state('thinking')
-            await websocket.send(json.dumps({"type": "mode", "mode": "thinking"}))
-
-            add_to_history("user", text)
-
-            loop = asyncio.get_event_loop()
-
-            response = await resolve_user_message(text, websocket)
-            response = strip_roleplay(response)
-
-            print(f"Jarvis: {response}")
-            add_to_history("assistant", response)
-
-            current_mode = "speaking"
-            if face:
-                face.set_state('speaking')
-            await websocket.send(json.dumps({"type": "response", "text": response}))
-
-            loop.run_in_executor(None, speak, response)
-            current_mode = "idle"
+            await process_user_text(text)
 
         # ── Voice ──
         elif msg_type == "voice":
-            current_mode = "listening"
-            if face:
-                face.set_state('listening')
-            await websocket.send(json.dumps({"type": "mode", "mode": "listening"}))
+            await process_voice_session()
 
-            loop = asyncio.get_event_loop()
-            audio = await loop.run_in_executor(None, record_audio, 5)
-            text = await loop.run_in_executor(None, transcribe, audio)
+        # ── Wake word + names ──
+        elif msg_type == "set_wake_word":
+            wake_word_enabled = bool(data.get("enabled", True))
+            state = "on" if wake_word_enabled else "off"
+            print(f"Wake word {state}")
+            await websocket.send(json.dumps({
+                "type": "wake_word_status",
+                "enabled": wake_word_enabled,
+            }))
 
-            if text:
-                await websocket.send(json.dumps({"type": "transcription", "text": text}))
-
-                current_mode = "thinking"
-                if face:
-                    face.set_state('thinking')
-                add_to_history("user", text)
-
-                response = await resolve_user_message(text, websocket)
-                response = strip_roleplay(response)
-                add_to_history("assistant", response)
-
-                current_mode = "speaking"
-                if face:
-                    face.set_state('speaking')
-                await websocket.send(json.dumps({"type": "response", "text": response}))
-
-                loop.run_in_executor(None, speak, response)
-                current_mode = "idle"
-                if face:
-                    face.set_state('idle')
-            else:
-                if face:
-                    face.set_state('confused')
-                await websocket.send(json.dumps({
-                    "type": "response",
-                    "text": "Sorry I didn't catch that. Try again!"
-                }))
-                current_mode = "idle"
-                if face:
-                    face.set_state('idle')
+        elif msg_type == "set_names":
+            if data.get("agent_name"):
+                agent_name = str(data["agent_name"]).strip() or agent_name
+            if data.get("user_name"):
+                USER_NAME = str(data["user_name"]).strip() or USER_NAME
+            print(f"Names updated — agent: {agent_name}, user: {USER_NAME}")
 
         # ── Clear memory ──
         elif msg_type == "clear_memory":
@@ -898,6 +1018,7 @@ async def handle_message(websocket, message: str):
                 await websocket.send(json.dumps({"type": "response", "text": "Restarting now!"}))
 
             elif action == "sleep":
+                is_asleep = True
                 current_mode = "idle"
                 if face:
                     face.set_state('idle')
@@ -907,6 +1028,7 @@ async def handle_message(websocket, message: str):
                 }))
 
             elif action == "wake":
+                is_asleep = False
                 if face:
                     face.set_state('idle')
                 await websocket.send(json.dumps({
@@ -915,6 +1037,7 @@ async def handle_message(websocket, message: str):
                 }))
 
             elif action == "mute":
+                mic_muted = True
                 await websocket.send(json.dumps({"type": "response", "text": "Microphone muted!"}))
 
         # ── Register PC daemon ──
@@ -1049,6 +1172,10 @@ async def handler(websocket):
         "type": "response",
         "text": f"Hey {USER_NAME}! Jarvis is online and ready."
     }))
+    await websocket.send(json.dumps({
+        "type": "wake_word_status",
+        "enabled": wake_word_enabled,
+    }))
 
     stats_task = asyncio.create_task(send_stats_loop(websocket))
 
@@ -1066,7 +1193,7 @@ async def handler(websocket):
 #  MAIN
 # ─────────────────────────────────────────
 async def main():
-    global face
+    global face, main_loop, wake_monitor, wake_audio_queue
 
     print("=" * 40)
     print("  JARVIS WINDOWS SERVER")
@@ -1077,6 +1204,20 @@ async def main():
     os.environ['SDL_VIDEO_WINDOW_POS'] = '0,0'
     print("Starting Jarvis face...")
     face = create_face_controller() if FACE_AVAILABLE else None
+
+    main_loop = asyncio.get_running_loop()
+    wake_audio_queue = asyncio.Queue()
+    asyncio.create_task(wake_word_worker())
+    wake_monitor = WakeWordMonitor(
+        on_utterance=queue_wake_audio,
+        should_listen=wake_word_should_listen,
+        audio_busy=audio_busy,
+    )
+    wake_monitor.start()
+    if wake_word_enabled:
+        print(f"Wake word enabled — say “Hey {agent_name}” near the PC mic")
+    else:
+        print("Wake word disabled (set WAKE_WORD_ENABLED=true or enable in app)")
 
     import socket
     local_ip = socket.gethostbyname(socket.gethostname())
